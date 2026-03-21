@@ -1,0 +1,35 @@
+# Flame-MoE (Megatron format) configuration
+checkpoint:
+  base_dir: "/mnt/sda1/yxz/Flame-moe/converted_checkpoints"
+  pattern: "iter_*"
+  step_regex: "iter_(\\d+)"
+
+format: megatron
+
+tensor_types:
+  weight:
+    source: model
+    key_template: "{param_name}"
+  momentum:
+    source: optimizer
+    key_template: "{chained_prefix}.optimizer.state.exp_avg.{param_name}"
+  variance:
+    source: optimizer
+    key_template: "{chained_prefix}.optimizer.state.exp_avg_sq.{param_name}"
+  master_weight:
+    source: optimizer
+    key_template: "{chained_prefix}.optimizer.state.fp32_param.{param_name}"
+
+megatron:
+  chained_prefix_default: "chained_0"
+  chained_prefix_expert: "chained_1"
+  chained_test_template: "chained_1.optimizer.state.exp_avg.{param_name}"
+
+compression:
+  methods:
+    - name: zstd
+      level: 3
+    - name: zstd_bytegrouping
+      level: 3
+    - name: zipnn
+      script_path: "/mnt/sda1/yxz/zipnn/scripts/zipnn_compress_safetensors.py"

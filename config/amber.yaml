@@ -1,0 +1,21 @@
+# Amber (HuggingFace format) configuration
+checkpoint:
+  base_dir: "amber_ckpts"
+  pattern: "ckpt_*"
+  step_regex: "ckpt_(\\d+)"
+
+format: huggingface
+
+tensor_types:
+  weight:
+    source: model
+    key_template: "{param_name}"
+
+compression:
+  methods:
+    - name: zstd
+      level: 3
+    - name: zstd_bytegrouping
+      level: 3
+    - name: zipnn
+      script_path: "/mnt/sda1/yxz/zipnn/scripts/zipnn_compress_safetensors.py"

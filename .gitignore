@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.znn.safetensors
+*.safetensors
+!config/*.yaml
