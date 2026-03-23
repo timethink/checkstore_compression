@@ -1,8 +1,11 @@
 """
 Run compression tests on extracted container safetensors files.
 
-For each container file, optionally rearranges to (Elements, Steps) layout,
-then tests all configured compression methods on both layouts.
+For each container file, tests all configured compression methods on:
+  1. Original layout
+  2. Rearranged (Elements x Steps) layout
+  3. XOR delta on original layout
+  4. XOR delta on rearranged layout
 
 Usage:
     python run_compression_test.py --config config/flame_moe.yaml \
@@ -80,6 +83,58 @@ def rearrange_container(input_path: str, output_path: str) -> bool:
 
 
 # =========================================================================
+# XOR delta: step_N = step_N XOR step_{N-1}  (step_0 kept as-is)
+# =========================================================================
+def _int_dtype_for(tensor):
+    sz = tensor.element_size()
+    return {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}.get(sz, torch.uint8)
+
+
+def xor_delta_container(input_path: str, output_path: str) -> bool:
+    """XOR each step with the previous step (original layout)."""
+    tensors = load_file(input_path)
+    step_keys = []
+    for k in tensors:
+        if k.startswith("step_"):
+            try:
+                step_keys.append((int(k.split("_")[1]), k))
+            except ValueError:
+                pass
+    step_keys.sort()
+    if len(step_keys) < 2:
+        return False
+
+    int_dtype = _int_dtype_for(tensors[step_keys[0][1]])
+    result = {}
+    prev_int = None
+    for _, key in step_keys:
+        t_int = tensors[key].contiguous().view(int_dtype)
+        if prev_int is None:
+            result[key] = t_int
+        else:
+            result[key] = torch.bitwise_xor(t_int, prev_int)
+        prev_int = t_int
+
+    save_file(result, output_path)
+    return True
+
+
+def xor_delta_rearranged(input_path: str, output_path: str) -> bool:
+    """XOR along the Steps axis on rearranged [Elements, Steps] data."""
+    tensors = load_file(input_path)
+    data = tensors["data"]
+    int_dtype = _int_dtype_for(data)
+    d = data.contiguous().view(int_dtype)
+
+    result = torch.empty_like(d)
+    result[:, 0] = d[:, 0]
+    result[:, 1:] = torch.bitwise_xor(d[:, 1:], d[:, :-1])
+
+    save_file({"data": result}, output_path)
+    return True
+
+
+# =========================================================================
 # Build compressor instances from config
 # =========================================================================
 def build_compressors(config: dict):
@@ -124,7 +179,8 @@ def test_file(filepath: str, compressors, tag: str) -> dict:
 # =========================================================================
 # Process a single container file
 # =========================================================================
-def process_single_file(filepath: str, compressors, skip_rearrange: bool = False):
+def process_single_file(filepath: str, compressors, zstd_compressor,
+                        skip_rearrange: bool = False):
     print(f"\n{'='*60}")
     print(f"Processing: {filepath}")
 
@@ -134,16 +190,57 @@ def process_single_file(filepath: str, compressors, skip_rearrange: bool = False
     print("  >> Original layout")
     row.update(test_file(filepath, compressors, "Orig"))
 
+    parent = os.path.dirname(filepath)
+    base = os.path.basename(filepath)
+
+    # XOR delta on original layout
+    xor_orig_path = os.path.join(parent, f"_xor_orig_{base}")
+    try:
+        ok = xor_delta_container(filepath, xor_orig_path)
+        if ok:
+            print("  >> XOR delta (original layout)")
+            result = zstd_compressor.compress(xor_orig_path)
+            if result is not None:
+                row["XorOrig_ZSTD"] = result.ratio
+                print(f"  [ZSTD] XorOrig: "
+                      f"{result.compressed_size / 1024**2:.2f} MB, "
+                      f"ratio={result.ratio:.4f}")
+            else:
+                row["XorOrig_ZSTD"] = None
+    except Exception as e:
+        print(f"  >> XOR delta (original) failed: {e}")
+    finally:
+        if os.path.exists(xor_orig_path):
+            os.remove(xor_orig_path)
+
     # Rearranged layout
     if not skip_rearrange:
-        parent = os.path.dirname(filepath)
-        base = os.path.basename(filepath)
         rearranged_path = os.path.join(parent, f"_rearranged_{base}")
         try:
             ok = rearrange_container(filepath, rearranged_path)
             if ok:
                 print("  >> Rearranged layout (Elements x Steps)")
                 row.update(test_file(rearranged_path, compressors, "Rearranged"))
+
+                # XOR delta on rearranged layout
+                xor_rearr_path = os.path.join(parent, f"_xor_rearr_{base}")
+                try:
+                    ok2 = xor_delta_rearranged(rearranged_path, xor_rearr_path)
+                    if ok2:
+                        print("  >> XOR delta (rearranged layout)")
+                        result = zstd_compressor.compress(xor_rearr_path)
+                        if result is not None:
+                            row["XorRearr_ZSTD"] = result.ratio
+                            print(f"  [ZSTD] XorRearr: "
+                                  f"{result.compressed_size / 1024**2:.2f} MB, "
+                                  f"ratio={result.ratio:.4f}")
+                        else:
+                            row["XorRearr_ZSTD"] = None
+                except Exception as e:
+                    print(f"  >> XOR delta (rearranged) failed: {e}")
+                finally:
+                    if os.path.exists(xor_rearr_path):
+                        os.remove(xor_rearr_path)
             else:
                 print("  >> Rearrange skipped (no step keys found)")
         except Exception as e:
@@ -189,13 +286,17 @@ def main():
 
     print(f"Compression methods: {[c.name for c in compressors]}")
 
+    # Dedicated ZSTD compressor for XOR delta tests
+    zstd_compressor = get_compressor("zstd", level=3)
+
     # Discover all safetensors files
     import glob
     files = sorted(glob.glob(
         os.path.join(args.input_dir, "**", "*.safetensors"), recursive=True
     ))
-    # Exclude rearranged temp files
-    files = [f for f in files if not os.path.basename(f).startswith("_rearranged_")]
+    # Exclude temp files
+    files = [f for f in files
+             if not os.path.basename(f).startswith(("_rearranged_", "_xor_"))]
 
     if not files:
         print(f"No safetensors files found in {args.input_dir}")
@@ -216,7 +317,8 @@ def main():
     for fp in tqdm(files, desc="Files"):
         if fp in existing_files:
             continue
-        row = process_single_file(fp, compressors, args.skip_rearrange)
+        row = process_single_file(fp, compressors, zstd_compressor,
+                                  args.skip_rearrange)
         if row:
             new_results.append(row)
 

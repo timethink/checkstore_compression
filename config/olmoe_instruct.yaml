@@ -1,0 +1,19 @@
+# OLMoE-instruct (HuggingFace format) configuration
+checkpoint:
+  base_dir: "/mnt/sda1/yxz/OLMoE-instruct_Downloads"
+  pattern: "step_*"
+  step_regex: "step_(\\d+)"
+
+format: huggingface
+
+tensor_types:
+  weight:
+    source: model
+    key_template: "{param_name}"
+
+compression:
+  methods:
+    - name: zstd
+      level: 3
+    - name: zstd_bytegrouping
+      level: 3
